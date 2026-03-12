@@ -298,7 +298,11 @@ maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler) ->
   case catch hackney_conn:get_protocol(ConnPid) of
     http2 ->
       %% HTTP/2 negotiated - register for connection sharing
-      PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options);
+      PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options),
+      %% Shared H2 connections must be owned by the pool, not by the
+      %% first requester that happened to establish them.
+      _ = catch hackney_conn:set_owner_to_pool(ConnPid),
+      ok;
     http1 ->
       ok;
     http3 ->

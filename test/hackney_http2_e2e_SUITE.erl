@@ -33,7 +33,8 @@
     nghttp2_simple_get/1,
     nghttp2_concurrent_streams/1,
     google_strict_headers/1,
-    cloudflare_http2/1
+    cloudflare_http2/1,
+    cloudflare_quic_pooled_h2_loop/1
 ]).
 
 -define(TIMEOUT, 30000).
@@ -50,7 +51,8 @@ groups() ->
         nghttp2_simple_get,
         nghttp2_concurrent_streams,
         google_strict_headers,
-        cloudflare_http2
+        cloudflare_http2,
+        cloudflare_quic_pooled_h2_loop
     ]}].
 
 init_per_suite(Config) ->
@@ -168,6 +170,41 @@ cloudflare_http2(_Config) ->
             ct:fail({cloudflare_request_failed, Reason})
     end.
 
+%% @doc Regression test for pooled HTTP/2 reuse on cloudflare-quic.com.
+%% Warm up a pooled H2 connection, then run two tight request loops in
+%% parallel. Without the pooled-connection fix, one or both workers can
+%% stall indefinitely on the shared H2 connection.
+cloudflare_quic_pooled_h2_loop(_Config) ->
+    case inet:gethostbyname("cloudflare-quic.com") of
+        {error, Reason} ->
+            {skip, {cloudflare_quic_unavailable, Reason}};
+        {ok, _} ->
+            URL = <<"https://cloudflare-quic.com/">>,
+            Pool = cloudflare_quic_h2_pool_regression,
+            Opts = [{pool, Pool}, {recv_timeout, ?TIMEOUT}],
+
+            ok = hackney_pool:start_pool(Pool, [{max_connections, 10}]),
+            try
+                %% Warm up the pool so the concurrent workers share the same H2 connection.
+                {ok, 200, _, _} = hackney:request(get, URL, [], <<>>, Opts),
+                timer:sleep(50),
+
+                Results = run_request_loops(URL, Opts, 2, 3000, 10000),
+                ct:log("Cloudflare QUIC pooled H2 results: ~p", [Results]),
+
+                case Results of
+                    [{done, Count1}, {done, Count2}] when Count1 > 0, Count2 > 0 ->
+                        ok;
+                    _ ->
+                        ct:fail({pooled_h2_loop_failed, Results})
+                end
+            after
+                catch hackney_pool:stop_pool(Pool),
+                hackney_pool:unregister_h2_all(),
+                hackney_conn_sup:stop_all()
+            end
+    end.
+
 %%====================================================================
 %% Internal Functions
 %%====================================================================
@@ -178,4 +215,53 @@ check_network() ->
     case inet:gethostbyname("nghttp2.org") of
         {ok, _} -> ok;
         {error, Reason} -> {error, Reason}
+    end.
+
+run_request_loops(URL, Opts, WorkerCount, DurationMs, ReceiveTimeout) ->
+    Parent = self(),
+    Deadline = erlang:monotonic_time(millisecond) + DurationMs,
+    Worker = fun Self(Count) ->
+        case erlang:monotonic_time(millisecond) < Deadline of
+            true ->
+                case catch hackney:request(get, URL, [], <<>>, Opts) of
+                    {ok, 200, _, _} ->
+                        Self(Count + 1);
+                    {'EXIT', Reason} ->
+                        Parent ! {worker_result, self(), {exit, Reason, Count}};
+                    Other ->
+                        Parent ! {worker_result, self(), {error, Other, Count}}
+                end;
+            false ->
+                Parent ! {worker_result, self(), {done, Count}}
+        end
+    end,
+    Workers = maps:from_list([begin
+        {Pid, MonRef} = spawn_monitor(fun() -> Worker(0) end),
+        {Pid, MonRef}
+    end || _ <- lists:seq(1, WorkerCount)]),
+    collect_worker_results(Workers, ReceiveTimeout, []).
+
+collect_worker_results(Workers, _ReceiveTimeout, Acc) when map_size(Workers) =:= 0 ->
+    lists:reverse(Acc);
+collect_worker_results(Workers, ReceiveTimeout, Acc) ->
+    receive
+        {worker_result, Pid, Result} ->
+            case maps:take(Pid, Workers) of
+                {MonRef, Rest} ->
+                    erlang:demonitor(MonRef, [flush]),
+                    collect_worker_results(Rest, ReceiveTimeout, [Result | Acc]);
+                error ->
+                    collect_worker_results(Workers, ReceiveTimeout, Acc)
+            end;
+        {'DOWN', _MonRef, process, _Pid, normal} ->
+            collect_worker_results(Workers, ReceiveTimeout, Acc);
+        {'DOWN', _MonRef, process, Pid, Reason} ->
+            case maps:take(Pid, Workers) of
+                {_, Rest} ->
+                    collect_worker_results(Rest, ReceiveTimeout, [{crashed, Reason} | Acc]);
+                error ->
+                    collect_worker_results(Workers, ReceiveTimeout, Acc)
+            end
+    after ReceiveTimeout ->
+        lists:reverse(Acc, lists:duplicate(map_size(Workers), timeout))
     end.

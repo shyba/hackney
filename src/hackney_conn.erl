@@ -67,6 +67,7 @@
     set_location/2,
     %% Pool management
     release_to_pool/1,
+    set_owner_to_pool/1,
     verify_socket/1,
     is_ready/1,
     %% SSL upgrade
@@ -416,6 +417,13 @@ close(Pid) ->
 release_to_pool(Pid) ->
     gen_statem:call(Pid, release_to_pool, 5000).
 
+%% @doc Transfer ownership to the configured pool without checking the
+%% connection back into the HTTP/1 connection pool. Used for shared
+%% multiplexed connections like HTTP/2.
+-spec set_owner_to_pool(pid()) -> ok | {error, term()}.
+set_owner_to_pool(Pid) ->
+    gen_statem:call(Pid, set_owner_to_pool, 5000).
+
 %% @doc Set a new owner for this connection (sync).
 %% This updates the process being monitored - if the new owner crashes,
 %% the connection will terminate. Used by the pool when checking out
@@ -665,9 +673,10 @@ connected(enter, OldState, #conn_data{transport = Transport, socket = Socket,
             %% Transfer ownership back to pool and notify it
             auto_release_to_pool(Data)
     end,
-    case Timeout of
-        infinity -> {keep_state, Data2};
-        _ -> {keep_state, Data2, [{state_timeout, Timeout, idle_timeout}]}
+    case {Timeout, Data2#conn_data.protocol} of
+        {infinity, _} -> {keep_state, Data2};
+        {_, http1} -> {keep_state, Data2, [{state_timeout, Timeout, idle_timeout}]};
+        _ -> {keep_state, Data2}
     end;
 
 connected({call, From}, release_to_pool, #conn_data{pool_pid = PoolPid, owner_mon = OldMon,
@@ -691,6 +700,14 @@ connected({call, From}, release_to_pool, #conn_data{pool_pid = PoolPid, owner_mo
     %% Notify pool that connection is available for reuse (sync)
     notify_pool_available_sync(Data2),
     {keep_state, Data2, [{reply, From, ok}]};
+
+connected({call, From}, set_owner_to_pool, #conn_data{pool_pid = undefined} = Data) ->
+    {keep_state, Data, [{reply, From, {error, no_pool}}]};
+connected({call, From}, set_owner_to_pool, #conn_data{pool_pid = PoolPid, owner_mon = OldMon} = Data) ->
+    demonitor(OldMon, [flush]),
+    NewMon = monitor(process, PoolPid),
+    {keep_state, Data#conn_data{owner = PoolPid, owner_mon = NewMon},
+     [{reply, From, ok}]};
 
 connected({call, From}, {set_owner, NewOwner}, #conn_data{owner_mon = OldMon} = Data) ->
     %% Update owner - demonitor old, monitor new
@@ -2335,7 +2352,7 @@ init_h2_after_upgrade(SslSocket, Data, From) ->
                         h2_machine = H2Machine,
                         h2_streams = #{}
                     },
-                    {keep_state, NewData, [{reply, From, ok}]};
+                    {keep_state, NewData, [{reply, From, ok}, {state_timeout, infinity, idle_timeout}]};
                 {error, SetoptsErr} ->
                     {keep_state_and_data, [{reply, From, {error, SetoptsErr}}]}
             end;
@@ -2582,58 +2599,55 @@ normalize_headers(Headers) ->
 handle_h2_data(RecvData, Data) ->
     #conn_data{buffer = Buffer, transport = Transport, socket = Socket} = Data,
     FullData = <<Buffer/binary, RecvData/binary>>,
-    case parse_h2_frames(FullData, Data#conn_data{buffer = <<>>}) of
-        {ok, NewData} ->
+    case parse_h2_frames(FullData, Data#conn_data{buffer = <<>>}, []) of
+        {ok, NewData, Actions} ->
             %% Continue receiving if we have pending streams
             case maps:size(NewData#conn_data.h2_streams) > 0 of
                 true ->
                     case Transport:setopts(Socket, [{active, once}]) of
-                        ok -> {keep_state, NewData};
-                        {error, _} -> {next_state, closed, NewData#conn_data{socket = undefined}}
+                        ok -> {keep_state, NewData, Actions};
+                        {error, _} -> {next_state, closed, NewData#conn_data{socket = undefined}, Actions}
                     end;
                 false ->
-                    {keep_state, NewData}
+                    {keep_state, NewData, Actions}
             end;
-        {reply, Reply, NewData} ->
-            %% Reply to caller and continue
-            case NewData#conn_data.request_from of
-                undefined ->
-                    {keep_state, NewData};
-                From ->
-                    case Transport:setopts(Socket, [{active, once}]) of
-                        ok ->
-                            {keep_state, NewData#conn_data{request_from = undefined}, [{reply, From, Reply}]};
-                        {error, _} ->
-                            {next_state, closed, NewData#conn_data{socket = undefined, request_from = undefined},
-                             [{reply, From, Reply}]}
-                    end
-            end;
-        {error, Reason, NewData} ->
+        {error, Reason, NewData, Actions} ->
             %% Error - reply and close
             case NewData#conn_data.request_from of
                 undefined ->
-                    {next_state, closed, NewData};
+                    {next_state, closed, NewData, Actions};
                 From ->
-                    {next_state, closed, NewData, [{reply, From, {error, Reason}}]}
+                    case lists:any(fun({reply, F, _}) -> F =:= From end, Actions) of
+                        true ->
+                            {next_state, closed, NewData, Actions};
+                        false ->
+                            {next_state, closed, NewData, [{reply, From, {error, Reason}} | Actions]}
+                    end
             end
     end.
 
-%% @private Parse HTTP/2 frames from buffer
-parse_h2_frames(Buffer, Data) ->
+%% @private Parse HTTP/2 frames from buffer and collect reply actions
+parse_h2_frames(Buffer, Data, Actions) ->
     case hackney_http2:parse(Buffer) of
         {ok, Frame, Rest} ->
             case handle_h2_frame(Frame, Data) of
                 {ok, NewData} ->
-                    parse_h2_frames(Rest, NewData);
+                    parse_h2_frames(Rest, NewData, Actions);
                 {reply, Reply, NewData} ->
-                    {reply, Reply, NewData#conn_data{buffer = Rest}};
+                    case NewData#conn_data.request_from of
+                        undefined ->
+                            parse_h2_frames(Rest, NewData, Actions);
+                        From ->
+                            parse_h2_frames(Rest, NewData#conn_data{request_from = undefined},
+                                            [{reply, From, Reply} | Actions])
+                    end;
                 {error, Reason, NewData} ->
-                    {error, Reason, NewData}
+                    {error, Reason, NewData, lists:reverse(Actions)}
             end;
         more ->
-            {ok, Data#conn_data{buffer = Buffer}};
+            {ok, Data#conn_data{buffer = Buffer}, lists:reverse(Actions)};
         {connection_error, ErrorCode, _Reason} ->
-            {error, {h2_connection_error, ErrorCode}, Data}
+            {error, {h2_connection_error, ErrorCode}, Data, lists:reverse(Actions)}
     end.
 
 %% @private Handle individual HTTP/2 frames

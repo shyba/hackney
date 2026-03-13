@@ -94,7 +94,7 @@ connect(Transport, Host, Port, Options) ->
       connect_direct(Transport, Host, Port, Options);
     _PoolName ->
       %% Pool mode with per-host load regulation
-      connect_pool(Transport, Host, Port, Options)
+      connect_pool(Transport, Host, Port, Options, false)
   end.
 
 %% @private Direct connection without pool
@@ -138,7 +138,7 @@ connect_direct(Transport, Host, Port, Options) ->
 %% 5. Upgrade to SSL if needed (in-place upgrade)
 %% 6. If HTTP/2 negotiated, register for multiplexing
 %% Note: load_regulation slot is released when connection is checked in or dies
-connect_pool(Transport, Host, Port, Options) ->
+connect_pool(Transport, Host, Port, Options, true) ->
   PoolHandler = hackney_app:get_app_env(pool_handler, hackney_pool),
 
   %% Check which protocols are allowed (default from application env)
@@ -158,27 +158,51 @@ connect_pool(Transport, Host, Port, Options) ->
           %% Try HTTP/2 multiplexing
           case PoolHandler:checkout_h2(Host, Port, Transport, Options) of
             {ok, H2Pid} ->
-              %% Verify connection is actually in connected state
-              %% (OTP 28 on FreeBSD may have timing issues with SSL connections)
-              case hackney_conn:get_state(H2Pid) of
-                {ok, connected} ->
+              %% Verify the shared connection is still usable before reuse.
+              case shared_connection_ready(H2Pid) of
+                true ->
                   hackney_manager:start_request(Host),
                   {ok, H2Pid};
-                _ ->
+                false ->
                   %% Connection not ready, unregister and create new
                   PoolHandler:unregister_h2(H2Pid, Options),
-                  connect_pool_new(Transport, Host, Port, Options, PoolHandler)
+                  connect_pool_new(Transport, Host, Port, Options, PoolHandler, true)
               end;
             none ->
-              connect_pool_new(Transport, Host, Port, Options, PoolHandler)
+              connect_pool_new(Transport, Host, Port, Options, PoolHandler, true)
           end;
         _ ->
           %% No multiplexed protocols allowed or available
-          connect_pool_new(Transport, Host, Port, Options, PoolHandler)
+          connect_pool_new(Transport, Host, Port, Options, PoolHandler, true)
       end;
     _ ->
       %% Non-SSL, use normal pool
-      connect_pool_new(Transport, Host, Port, Options, PoolHandler)
+      connect_pool_new(Transport, Host, Port, Options, PoolHandler, true)
+  end;
+
+connect_pool(Transport, Host, Port, Options, false) ->
+  PoolHandler = hackney_app:get_app_env(pool_handler, hackney_pool),
+  Protocols = proplists:get_value(protocols, Options, hackney_util:default_protocols()),
+  H3Allowed = lists:member(http3, Protocols),
+  case Transport of
+    hackney_ssl when H3Allowed ->
+      case try_new_h3_connection(Host, Port, Transport, Options, PoolHandler, false) of
+        {ok, H3Pid} ->
+          hackney_manager:start_request(Host),
+          {ok, H3Pid};
+        _ ->
+          connect_pool_new(Transport, Host, Port, Options, PoolHandler, false)
+      end;
+    _ ->
+      connect_pool_new(Transport, Host, Port, Options, PoolHandler, false)
+  end.
+
+connect_request_path(Transport, Host, Port, Options) ->
+  case use_pool(Options) of
+    false ->
+      connect_direct(Transport, Host, Port, Options);
+    _PoolName ->
+      connect_pool(Transport, Host, Port, Options, true)
   end.
 
 %% @private Try to get or establish an HTTP/3 connection
@@ -191,27 +215,27 @@ try_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
       %% Check if we have an existing HTTP/3 connection
       case PoolHandler:checkout_h3(Host, Port, Transport, Options) of
         {ok, H3Pid} ->
-          %% Verify connection is actually in connected state
-          case hackney_conn:get_state(H3Pid) of
-            {ok, connected} ->
+          %% Verify the shared connection is still usable before reuse.
+          case shared_connection_ready(H3Pid) of
+            true ->
               {ok, H3Pid};
-            _ ->
+            false ->
               %% Connection not ready, unregister and try new connection
               PoolHandler:unregister_h3(H3Pid, Options),
-              try_new_h3_connection(Host, Port, Transport, Options, PoolHandler)
+              try_new_h3_connection(Host, Port, Transport, Options, PoolHandler, true)
           end;
         none ->
           %% Check Alt-Svc cache for known HTTP/3 endpoint
           case hackney_altsvc:lookup(Host, Port) of
             {ok, h3, H3Port} ->
               %% Alt-Svc says HTTP/3 is available, try connecting
-              try_new_h3_connection(Host, H3Port, Transport, Options, PoolHandler);
+              try_new_h3_connection(Host, H3Port, Transport, Options, PoolHandler, true);
             none ->
               %% No Alt-Svc cached, only try H3 if explicitly requested
               case lists:member(http3, proplists:get_value(protocols, Options, [])) of
                 true ->
                   %% User explicitly wants HTTP/3, try it
-                  try_new_h3_connection(Host, Port, Transport, Options, PoolHandler);
+                  try_new_h3_connection(Host, Port, Transport, Options, PoolHandler, true);
                 false ->
                   false
               end
@@ -220,9 +244,11 @@ try_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
   end.
 
 %% @private Establish a new HTTP/3 connection
-try_new_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
+try_new_h3_connection(Host, Port, Transport, Options, PoolHandler, ShareConnection) ->
   %% Start HTTP/3 connection via hackney_conn
   ConnectTimeout = proplists:get_value(connect_timeout, Options, 8000),
+  PoolName = proplists:get_value(pool, Options, default),
+  PoolPid = hackney_pool:find_pool(PoolName),
   ConnOpts = #{
     host => Host,
     port => Port,
@@ -230,7 +256,8 @@ try_new_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
     connect_timeout => ConnectTimeout,
     recv_timeout => proplists:get_value(recv_timeout, Options, 5000),
     connect_options => [{protocols, [http3]}],
-    ssl_options => proplists:get_value(ssl_options, Options, [])
+    ssl_options => proplists:get_value(ssl_options, Options, []),
+    pool_pid => case ShareConnection of true -> PoolPid; false -> undefined end
   },
   case hackney_conn_sup:start_conn(ConnOpts) of
     {ok, ConnPid} ->
@@ -239,9 +266,20 @@ try_new_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
           %% Verify it's HTTP/3
           case catch hackney_conn:get_protocol(ConnPid) of
             http3 ->
-              %% Register for multiplexing
-              PoolHandler:register_h3(Host, Port, Transport, ConnPid, Options),
-              {ok, ConnPid};
+              case ShareConnection of
+                true ->
+                  case promote_shared_connection(ConnPid, Host, Port, Transport, Options,
+                                                 PoolHandler, http3) of
+                    ok ->
+                      {ok, ConnPid};
+                    {error, _} ->
+                      catch hackney_conn:stop(ConnPid),
+                      hackney_altsvc:mark_h3_blocked(Host, Port),
+                      false
+                  end;
+                false ->
+                  {ok, ConnPid}
+              end;
             _ ->
               %% Not HTTP/3 or connection terminated, close and fail
               catch hackney_conn:stop(ConnPid),
@@ -258,7 +296,7 @@ try_new_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
       false
   end.
 
-connect_pool_new(Transport, Host, Port, Options, PoolHandler) ->
+connect_pool_new(Transport, Host, Port, Options, PoolHandler, AllowShared) ->
   MaxPerHost = proplists:get_value(max_per_host, Options, 50),
   CheckoutTimeout = proplists:get_value(checkout_timeout, Options,
                       proplists:get_value(connect_timeout, Options, 8000)),
@@ -274,9 +312,16 @@ connect_pool_new(Transport, Host, Port, Options, PoolHandler) ->
           case maybe_upgrade_ssl(Transport, ConnPid, Host, Options) of
             ok ->
               %% Check if HTTP/2 was negotiated, register for multiplexing
-              maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler),
-              hackney_manager:start_request(Host),
-              {ok, ConnPid};
+              case maybe_register_h2(ConnPid, Host, Port, Transport, Options,
+                                     PoolHandler, AllowShared) of
+                ok ->
+                  hackney_manager:start_request(Host),
+                  {ok, ConnPid};
+                {error, Reason} ->
+                  hackney_load_regulation:release(Host, Port),
+                  catch hackney_conn:stop(ConnPid),
+                  {error, Reason}
+              end;
             {error, Reason} ->
               %% Upgrade failed - release slot and close connection
               hackney_load_regulation:release(Host, Port),
@@ -294,18 +339,44 @@ connect_pool_new(Transport, Host, Port, Options, PoolHandler) ->
 
 %% @private Register HTTP/2 connection for multiplexing if applicable
 %% Uses catch to handle race condition where connection terminates before call
-maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler) ->
+maybe_register_h2(_ConnPid, _Host, _Port, _Transport, _Options, _PoolHandler, false) ->
+  ok;
+maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler, true) ->
   case catch hackney_conn:get_protocol(ConnPid) of
     http2 ->
-      %% HTTP/2 negotiated - register for connection sharing
-      PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options);
+      promote_shared_connection(ConnPid, Host, Port, Transport, Options,
+                                PoolHandler, http2);
     http1 ->
       ok;
     http3 ->
       ok;
     {'EXIT', _} ->
-      %% Connection terminated before we could check - ignore
-      ok
+      {error, connection_closed}
+  end.
+
+shared_connection_ready(ConnPid) ->
+  case catch hackney_conn:shared_status(ConnPid) of
+    {ok, connected} ->
+      true;
+    _ ->
+      false
+  end.
+
+promote_shared_connection(ConnPid, Host, Port, Transport, Options, PoolHandler, Proto) ->
+  case catch hackney_conn:set_owner_to_pool(ConnPid) of
+    ok ->
+      case Proto of
+        http2 ->
+          PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options);
+        http3 ->
+          PoolHandler:register_h3(Host, Port, Transport, ConnPid, Options)
+      end;
+    {error, Reason} ->
+      {error, Reason};
+    {'EXIT', Reason} ->
+      {error, Reason};
+    Other ->
+      {error, Other}
   end.
 
 %% @private Upgrade TCP connection to SSL if needed
@@ -1229,7 +1300,7 @@ maybe_proxy(Transport, Scheme, Host, Port, Options) ->
   case get_proxy_config(Scheme, Host, Options) of
     false ->
       %% No proxy configured, direct connection
-      connect(Transport, Host, Port, Options);
+      connect_request_path(Transport, Host, Port, Options);
     {connect, ProxyHost, ProxyPort, ProxyAuth, ProxyTransport} ->
       %% HTTP CONNECT tunnel (for HTTPS through HTTP/HTTPS proxy)
       connect_via_connect_proxy(Transport, Host, Port, ProxyHost, ProxyPort, ProxyAuth, ProxyTransport, Options);

@@ -22,10 +22,6 @@ setup() ->
     {ok, _} = application:ensure_all_started(hackney),
     ok.
 
-cleanup(_) ->
-    hackney_conn_sup:stop_all(),
-    ok.
-
 %%====================================================================
 %% Protocol Detection Tests (Unit tests - no network required)
 %%====================================================================

@@ -200,7 +200,7 @@ test_h3_async_true() ->
             URL = <<"https://cloudflare.com/cdn-cgi/trace">>,
             Opts = [{protocols, [http3]}, {connect_timeout, 15000}, {async, true}],
             case hackney:get(URL, [], <<>>, Opts) of
-                {ok, Ref} when is_pid(Ref) ->
+                {ok, Ref} when is_reference(Ref) ->
                     %% Collect all async messages
                     Messages = collect_async_messages(Ref, 10000),
                     ?debugFmt("Async messages: ~p", [Messages]),
@@ -220,9 +220,9 @@ test_h3_async_once() ->
         true ->
             %% Async once mode - should still work (data is pushed by QUIC)
             URL = <<"https://cloudflare.com/cdn-cgi/trace">>,
-            Opts = [{protocols, [http3]}, {connect_timeout, 15000}, {async, once}],
+            Opts = [{protocols, [http3]}, {connect_timeout, 15000}, {async, once}, {pool, false}],
             case hackney:get(URL, [], <<>>, Opts) of
-                {ok, Ref} when is_pid(Ref) ->
+                {ok, Ref} when is_reference(Ref) ->
                     %% Collect messages
                     Messages = collect_async_messages(Ref, 10000),
                     ?debugFmt("Async once messages: ~p", [Messages]),
@@ -241,7 +241,7 @@ test_h3_async_status() ->
             URL = <<"https://cloudflare.com/">>,
             Opts = [{protocols, [http3]}, {connect_timeout, 15000}, {async, true}],
             case hackney:get(URL, [], <<>>, Opts) of
-                {ok, Ref} when is_pid(Ref) ->
+                {ok, Ref} when is_reference(Ref) ->
                     Messages = collect_async_messages(Ref, 10000),
                     %% Find status message
                     StatusMsg = find_message(fun({hackney_response, _, {status, S, _}}) -> is_integer(S);
@@ -263,7 +263,7 @@ test_h3_async_headers() ->
             URL = <<"https://cloudflare.com/">>,
             Opts = [{protocols, [http3]}, {connect_timeout, 15000}, {async, true}],
             case hackney:get(URL, [], <<>>, Opts) of
-                {ok, Ref} when is_pid(Ref) ->
+                {ok, Ref} when is_reference(Ref) ->
                     Messages = collect_async_messages(Ref, 10000),
                     %% Find headers message
                     HeadersMsg = find_message(fun({hackney_response, _, {headers, H}}) -> is_list(H);

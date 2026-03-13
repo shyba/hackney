@@ -146,7 +146,7 @@ checkout_h2(Host, Port, Transport, Options) ->
     PoolName = proplists:get_value(pool, Options, default),
     ConnectTimeout = proplists:get_value(connect_timeout, Options, 8000),
     Pool = find_pool(PoolName, Options),
-    Key = {Host, Port, Transport},
+    Key = connection_key(Host, Port, Transport),
     try
         gen_server:call(Pool, {checkout_h2, Key}, ConnectTimeout)
     catch
@@ -161,8 +161,8 @@ checkout_h2(Host, Port, Transport, Options) ->
 register_h2(Host, Port, Transport, Pid, Options) ->
     PoolName = proplists:get_value(pool, Options, default),
     Pool = find_pool(PoolName, Options),
-    Key = {Host, Port, Transport},
-    gen_server:cast(Pool, {register_h2, Key, Pid}),
+    Key = connection_key(Host, Port, Transport),
+    gen_server:call(Pool, {register_h2, Key, Pid}),
     ok.
 
 %% @doc Remove an HTTP/2 connection from the pool (e.g., on GOAWAY).
@@ -193,7 +193,7 @@ checkout_h3(Host, Port, Transport, Options) ->
     PoolName = proplists:get_value(pool, Options, default),
     ConnectTimeout = proplists:get_value(connect_timeout, Options, 8000),
     Pool = find_pool(PoolName, Options),
-    Key = {Host, Port, Transport},
+    Key = connection_key(Host, Port, Transport),
     try
         gen_server:call(Pool, {checkout_h3, Key}, ConnectTimeout)
     catch
@@ -208,8 +208,8 @@ checkout_h3(Host, Port, Transport, Options) ->
 register_h3(Host, Port, Transport, Pid, Options) ->
     PoolName = proplists:get_value(pool, Options, default),
     Pool = find_pool(PoolName, Options),
-    Key = {Host, Port, Transport},
-    gen_server:cast(Pool, {register_h3, Key, Pid}),
+    Key = connection_key(Host, Port, Transport),
+    gen_server:call(Pool, {register_h3, Key, Pid}),
     ok.
 
 %% @doc Remove an HTTP/3 connection from the pool (e.g., on connection close).
@@ -523,6 +523,18 @@ handle_call({checkout_h3, Key}, _From, #state{h3_connections = H3Conns} = State)
             end
     end;
 
+handle_call({register_h2, Key, Pid}, _From, State) ->
+    %% Promote a checked-out connection into the shared HTTP/2 registry.
+    %% Shared H2 connections are pool-owned but not part of the normal
+    %% HTTP/1 available/in_use lifecycle.
+    State2 = do_register_h2(Key, Pid, State),
+    {reply, ok, State2};
+
+handle_call({register_h3, Key, Pid}, _From, State) ->
+    %% Promote a connection into the shared HTTP/3 registry.
+    State2 = do_register_h3(Key, Pid, State),
+    {reply, ok, State2};
+
 handle_call(unregister_h2_all, _From, State) ->
     %% Clear all HTTP/2 connections (for testing)
     {reply, ok, State#state{h2_connections = #{}}}.
@@ -559,38 +571,10 @@ handle_cast({prewarm_checkin, Pid, Key}, State) ->
     Available2 = maps:update_with(Key, fun(Pids) -> [Pid | Pids] end, [Pid], Available),
     {noreply, State#state{available=Available2, pid_monitors=PidMonitors2}};
 
-handle_cast({register_h2, Key, Pid}, State) ->
-    %% Register an HTTP/2 connection for sharing
-    #state{h2_connections = H2Conns, pid_monitors = PidMonitors} = State,
-    %% Monitor the connection if not already monitored
-    PidMonitors2 = case maps:is_key(Pid, PidMonitors) of
-        true -> PidMonitors;
-        false ->
-            MonRef = erlang:monitor(process, Pid),
-            maps:put(Pid, MonRef, PidMonitors)
-    end,
-    %% Store HTTP/2 connection
-    H2Conns2 = maps:put(Key, Pid, H2Conns),
-    {noreply, State#state{h2_connections = H2Conns2, pid_monitors = PidMonitors2}};
-
 handle_cast({unregister_h2, Pid}, State) ->
     %% Remove an HTTP/2 connection from the pool
     State2 = do_unregister_h2(Pid, State),
     {noreply, State2};
-
-handle_cast({register_h3, Key, Pid}, State) ->
-    %% Register an HTTP/3 connection for sharing
-    #state{h3_connections = H3Conns, pid_monitors = PidMonitors} = State,
-    %% Monitor the connection if not already monitored
-    PidMonitors2 = case maps:is_key(Pid, PidMonitors) of
-        true -> PidMonitors;
-        false ->
-            MonRef = erlang:monitor(process, Pid),
-            maps:put(Pid, MonRef, PidMonitors)
-    end,
-    %% Store HTTP/3 connection
-    H3Conns2 = maps:put(Key, Pid, H3Conns),
-    {noreply, State#state{h3_connections = H3Conns2, pid_monitors = PidMonitors2}};
 
 handle_cast({unregister_h3, Pid}, State) ->
     %% Remove an HTTP/3 connection from the pool
@@ -913,6 +897,56 @@ do_checkin_with_close_flag(Pid, ShouldClose, State) ->
             State
     end.
 
+%% @private Promote a connection from normal in_use bookkeeping into the
+%% shared HTTP/2 registry.
+do_register_h2(Key, Pid, #state{name = PoolName, h2_connections = H2Conns,
+                                pid_monitors = PidMonitors, in_use = InUse} = State) ->
+    ExistingPid = maps:get(Key, H2Conns, undefined),
+    %% Monitor the connection if not already monitored.
+    PidMonitors2 = case maps:is_key(Pid, PidMonitors) of
+        true -> PidMonitors;
+        false ->
+            MonRef = erlang:monitor(process, Pid),
+            maps:put(Pid, MonRef, PidMonitors)
+    end,
+    %% Shared H2 connections stay pool-owned, but should stop counting as an
+    %% HTTP/1-style checked-out connection once promoted.
+    {InUse2, _Released} = case maps:take(Pid, InUse) of
+        {{Host, Port, _Transport}, Rest} ->
+            hackney_load_regulation:release(Host, Port),
+            Labels = #{pool => PoolName},
+            _ = hackney_metrics:gauge_dec(hackney_pool_in_use_count, Labels),
+            {Rest, true};
+        error ->
+            {InUse, false}
+    end,
+    maybe_stop_replaced_shared_pid(ExistingPid, Pid),
+    H2Conns2 = maps:put(Key, Pid, H2Conns),
+    State#state{h2_connections = H2Conns2, pid_monitors = PidMonitors2, in_use = InUse2}.
+
+%% @private Promote a connection into the shared HTTP/3 registry.
+do_register_h3(Key, Pid, #state{name = PoolName, h3_connections = H3Conns,
+                                pid_monitors = PidMonitors, in_use = InUse} = State) ->
+    ExistingPid = maps:get(Key, H3Conns, undefined),
+    PidMonitors2 = case maps:is_key(Pid, PidMonitors) of
+        true -> PidMonitors;
+        false ->
+            MonRef = erlang:monitor(process, Pid),
+            maps:put(Pid, MonRef, PidMonitors)
+    end,
+    InUse2 = case maps:take(Pid, InUse) of
+        {{Host, Port, _Transport}, Rest} ->
+            hackney_load_regulation:release(Host, Port),
+            Labels = #{pool => PoolName},
+            _ = hackney_metrics:gauge_dec(hackney_pool_in_use_count, Labels),
+            Rest;
+        error ->
+            InUse
+    end,
+    maybe_stop_replaced_shared_pid(ExistingPid, Pid),
+    H3Conns2 = maps:put(Key, Pid, H3Conns),
+    State#state{h3_connections = H3Conns2, pid_monitors = PidMonitors2, in_use = InUse2}.
+
 %% @private Remove an HTTP/2 connection from the pool
 do_unregister_h2(Pid, State) ->
     #state{h2_connections = H2Conns, pid_monitors = PidMonitors} = State,
@@ -959,6 +993,14 @@ do_unregister_h3(Pid, State) ->
         error -> PidMonitors
     end,
     State#state{h3_connections = H3Conns2, pid_monitors = PidMonitors2}.
+
+maybe_stop_replaced_shared_pid(undefined, _Pid) ->
+    ok;
+maybe_stop_replaced_shared_pid(Pid, Pid) ->
+    ok;
+maybe_stop_replaced_shared_pid(OldPid, _Pid) ->
+    catch exit(OldPid, shutdown),
+    ok.
 
 %% @private Prewarm connections to a host
 %% Creates connections up to Count if there are fewer available.

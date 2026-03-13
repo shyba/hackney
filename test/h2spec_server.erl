@@ -276,25 +276,54 @@ handle_request(Socket, H2Machine0, StreamId, _IsFin, _Headers, PseudoHeaders) ->
     %% Simple response - 200 OK with body
     Method = maps:get(method, PseudoHeaders, <<"GET">>),
     Path = maps:get(path, PseudoHeaders, <<"/">>),
+    case Path of
+        <<"/coalesce">> ->
+            queue_coalesced_response(Socket, H2Machine0, StreamId, Method, Path);
+        <<"/goaway_batch">> ->
+            queue_goaway_batch(Socket, H2Machine0);
+        _ ->
+            send_simple_response(Socket, H2Machine0, StreamId, Method, Path)
+    end.
 
-    %% Prepare response
+send_simple_response(Socket, H2Machine0, StreamId, Method, Path) ->
+    {ok, H2Machine1, ResponseFrames} = build_simple_response(H2Machine0, StreamId, Method, Path),
+    ok = ssl:send(Socket, ResponseFrames),
+    {ok, H2Machine1}.
+
+queue_coalesced_response(Socket, H2Machine0, StreamId, Method, Path) ->
+    {ok, H2Machine1, ResponseFrames} = build_simple_response(H2Machine0, StreamId, Method, Path),
+    case erlang:get(coalesced_h2_response_frames) of
+        undefined ->
+            erlang:put(coalesced_h2_response_frames, ResponseFrames),
+            {ok, H2Machine1};
+        PendingFrames ->
+            erlang:erase(coalesced_h2_response_frames),
+            ok = ssl:send(Socket, [PendingFrames, ResponseFrames]),
+            {ok, H2Machine1}
+    end.
+
+queue_goaway_batch(Socket, H2Machine0) ->
+    case erlang:get(goaway_batch_pending) of
+        undefined ->
+            erlang:put(goaway_batch_pending, true),
+            {ok, H2Machine0};
+        true ->
+            erlang:erase(goaway_batch_pending),
+            LastStreamId = hackney_http2_machine:get_last_streamid(H2Machine0),
+            ok = send_goaway(Socket, LastStreamId, no_error),
+            {ok, H2Machine0}
+    end.
+
+build_simple_response(H2Machine0, StreamId, Method, Path) ->
     ResponseHeaders = [{<<"content-type">>, <<"text/plain">>}],
     ResponseBody = <<"Hello from h2spec test server\r\nMethod: ",
                      Method/binary, "\r\nPath: ", Path/binary>>,
-
-    %% Prepare and send headers
     {ok, _RespIsFin, HeaderBlock, H2Machine1} = hackney_http2_machine:prepare_headers(
         StreamId, H2Machine0, nofin,
         #{status => 200}, ResponseHeaders),
-
     HeadersFrame = hackney_http2:headers(StreamId, nofin, HeaderBlock),
-    ok = ssl:send(Socket, HeadersFrame),
-
-    %% Send body as DATA frame with END_STREAM
     DataFrame = hackney_http2:data(StreamId, fin, ResponseBody),
-    ok = ssl:send(Socket, DataFrame),
-
-    {ok, H2Machine1}.
+    {ok, H2Machine1, [HeadersFrame, DataFrame]}.
 
 send_goaway(Socket, LastStreamId, ErrorCode) ->
     Frame = hackney_http2:goaway(LastStreamId, ErrorCode, <<>>),

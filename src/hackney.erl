@@ -158,13 +158,12 @@ connect_pool(Transport, Host, Port, Options) ->
           %% Try HTTP/2 multiplexing
           case PoolHandler:checkout_h2(Host, Port, Transport, Options) of
             {ok, H2Pid} ->
-              %% Verify connection is actually in connected state
-              %% (OTP 28 on FreeBSD may have timing issues with SSL connections)
-              case hackney_conn:get_state(H2Pid) of
-                {ok, connected} ->
+              %% Verify the shared connection is still usable before reuse.
+              case shared_connection_ready(H2Pid) of
+                true ->
                   hackney_manager:start_request(Host),
                   {ok, H2Pid};
-                _ ->
+                false ->
                   %% Connection not ready, unregister and create new
                   PoolHandler:unregister_h2(H2Pid, Options),
                   connect_pool_new(Transport, Host, Port, Options, PoolHandler)
@@ -191,11 +190,11 @@ try_h3_connection(Host, Port, Transport, Options, PoolHandler) ->
       %% Check if we have an existing HTTP/3 connection
       case PoolHandler:checkout_h3(Host, Port, Transport, Options) of
         {ok, H3Pid} ->
-          %% Verify connection is actually in connected state
-          case hackney_conn:get_state(H3Pid) of
-            {ok, connected} ->
+          %% Verify the shared connection is still usable before reuse.
+          case shared_connection_ready(H3Pid) of
+            true ->
               {ok, H3Pid};
-            _ ->
+            false ->
               %% Connection not ready, unregister and try new connection
               PoolHandler:unregister_h3(H3Pid, Options),
               try_new_h3_connection(Host, Port, Transport, Options, PoolHandler)
@@ -297,8 +296,16 @@ connect_pool_new(Transport, Host, Port, Options, PoolHandler) ->
 maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler) ->
   case catch hackney_conn:get_protocol(ConnPid) of
     http2 ->
-      %% HTTP/2 negotiated - register for connection sharing
-      PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options);
+      %% Shared H2 connections must be owned by the pool, not by the
+      %% first requester that happened to establish them. Transfer
+      %% ownership before publishing the connection to the shared pool.
+      case catch hackney_conn:set_owner_to_pool(ConnPid) of
+        ok ->
+          PoolHandler:register_h2(Host, Port, Transport, ConnPid, Options);
+        _ ->
+          ok
+      end,
+      ok;
     http1 ->
       ok;
     http3 ->
@@ -306,6 +313,14 @@ maybe_register_h2(ConnPid, Host, Port, Transport, Options, PoolHandler) ->
     {'EXIT', _} ->
       %% Connection terminated before we could check - ignore
       ok
+  end.
+
+shared_connection_ready(ConnPid) ->
+  case catch hackney_conn:shared_status(ConnPid) of
+    {ok, connected} ->
+      true;
+    _ ->
+      false
   end.
 
 %% @private Upgrade TCP connection to SSL if needed

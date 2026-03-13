@@ -67,8 +67,10 @@
     set_location/2,
     %% Pool management
     release_to_pool/1,
+    set_owner_to_pool/1,
     verify_socket/1,
     is_ready/1,
+    shared_status/1,
     %% SSL upgrade
     upgrade_to_ssl/2,
     is_upgraded_ssl/1,
@@ -416,6 +418,13 @@ close(Pid) ->
 release_to_pool(Pid) ->
     gen_statem:call(Pid, release_to_pool, 5000).
 
+%% @doc Transfer ownership to the configured pool without checking the
+%% connection back into the HTTP/1 connection pool. Used for shared
+%% multiplexed connections like HTTP/2.
+-spec set_owner_to_pool(pid()) -> ok | {error, term()}.
+set_owner_to_pool(Pid) ->
+    gen_statem:call(Pid, set_owner_to_pool, 5000).
+
 %% @doc Set a new owner for this connection (sync).
 %% This updates the process being monitored - if the new owner crashes,
 %% the connection will terminate. Used by the pool when checking out
@@ -443,6 +452,12 @@ verify_socket(Pid) ->
 -spec is_ready(pid()) -> {ok, connected} | {ok, closed} | {error, term()}.
 is_ready(Pid) ->
     gen_statem:call(Pid, is_ready).
+
+%% @doc Check whether a shared multiplexed connection can be reused.
+%% Intended for pooled HTTP/2 and HTTP/3 connection reuse.
+-spec shared_status(pid()) -> {ok, connected} | {ok, closed} | {error, term()}.
+shared_status(Pid) ->
+    gen_statem:call(Pid, shared_status).
 
 %% @doc Upgrade a TCP connection to SSL.
 %% This performs an SSL handshake on the existing TCP socket.
@@ -613,6 +628,9 @@ idle({call, From}, connect, Data) ->
 idle({call, From}, get_state, _Data) ->
     {keep_state_and_data, [{reply, From, {ok, idle}}]};
 
+idle({call, From}, shared_status, _Data) ->
+    {keep_state_and_data, [{reply, From, {ok, closed}}]};
+
 idle(info, {'DOWN', Ref, process, _Pid, _Reason}, #conn_data{owner_mon = Ref} = Data) ->
     %% Owner died
     {stop, normal, Data};
@@ -632,6 +650,9 @@ connecting(state_timeout, connect_timeout, Data) ->
 
 connecting({call, From}, get_state, _Data) ->
     {keep_state_and_data, [{reply, From, {ok, connecting}}]};
+
+connecting({call, From}, shared_status, _Data) ->
+    {keep_state_and_data, [{reply, From, {ok, closed}}]};
 
 connecting(info, {'DOWN', Ref, process, _Pid, _Reason}, #conn_data{owner_mon = Ref} = Data) ->
     {stop, normal, Data};
@@ -665,9 +686,10 @@ connected(enter, OldState, #conn_data{transport = Transport, socket = Socket,
             %% Transfer ownership back to pool and notify it
             auto_release_to_pool(Data)
     end,
-    case Timeout of
-        infinity -> {keep_state, Data2};
-        _ -> {keep_state, Data2, [{state_timeout, Timeout, idle_timeout}]}
+    case {Timeout, Data2#conn_data.protocol} of
+        {infinity, _} -> {keep_state, Data2};
+        {_, http1} -> {keep_state, Data2, [{state_timeout, Timeout, idle_timeout}]};
+        _ -> {keep_state, Data2}
     end;
 
 connected({call, From}, release_to_pool, #conn_data{pool_pid = PoolPid, owner_mon = OldMon,
@@ -691,6 +713,19 @@ connected({call, From}, release_to_pool, #conn_data{pool_pid = PoolPid, owner_mo
     %% Notify pool that connection is available for reuse (sync)
     notify_pool_available_sync(Data2),
     {keep_state, Data2, [{reply, From, ok}]};
+
+connected({call, From}, set_owner_to_pool, #conn_data{pool_pid = undefined} = Data) ->
+    {keep_state, Data, [{reply, From, {error, no_pool}}]};
+connected({call, From}, set_owner_to_pool, #conn_data{pool_pid = PoolPid, owner_mon = OldMon} = Data) ->
+    demonitor(OldMon, [flush]),
+    NewMon = monitor(process, PoolPid),
+    NewData = Data#conn_data{owner = PoolPid, owner_mon = NewMon},
+    case ensure_h2_socket_active(NewData) of
+        ok ->
+            {keep_state, NewData, [{reply, From, ok}] ++ shared_h2_timeout_actions(NewData)};
+        {error, Reason} ->
+            {next_state, closed, NewData#conn_data{socket = undefined}, [{reply, From, {error, Reason}}]}
+    end;
 
 connected({call, From}, {set_owner, NewOwner}, #conn_data{owner_mon = OldMon} = Data) ->
     %% Update owner - demonitor old, monitor new
@@ -731,6 +766,15 @@ connected({call, From}, verify_socket, #conn_data{transport = Transport, socket 
         {error, Reason} ->
             {next_state, closed, Data#conn_data{socket = undefined}, [{reply, From, {error, Reason}}]}
     end;
+
+connected({call, From}, shared_status, Data) ->
+    apply_shared_status_result(From, shared_connection_status(Data));
+
+connected({call, From}, is_ready, #conn_data{protocol = http3} = Data) ->
+    apply_shared_status_result(From, shared_connection_status(Data));
+
+connected({call, From}, is_ready, #conn_data{protocol = http2} = Data) ->
+    apply_shared_status_result(From, shared_connection_status(Data));
 
 connected({call, From}, is_ready, #conn_data{socket = undefined} = Data) ->
     %% Socket not connected
@@ -913,6 +957,22 @@ connected(info, {ssl, Socket, RecvData}, #conn_data{socket = Socket, protocol = 
     handle_h2_data(RecvData, Data);
 connected(info, {tcp, Socket, RecvData}, #conn_data{socket = Socket, protocol = http2} = Data) ->
     handle_h2_data(RecvData, Data);
+connected(internal, drain_h2_buffer, #conn_data{protocol = http2, buffer = <<>>} = Data) ->
+    maybe_rearm_h2_socket(Data, []);
+connected(internal, drain_h2_buffer, #conn_data{protocol = http2} = Data) ->
+    handle_h2_data(<<>>, Data);
+
+connected(info, {tcp_closed, Socket}, #conn_data{socket = Socket, protocol = http2} = Data) ->
+    close_h2_connection(closed, Data#conn_data{socket = undefined});
+
+connected(info, {ssl_closed, Socket}, #conn_data{socket = Socket, protocol = http2} = Data) ->
+    close_h2_connection(closed, Data#conn_data{socket = undefined});
+
+connected(info, {tcp_error, Socket, Reason}, #conn_data{socket = Socket, protocol = http2} = Data) ->
+    close_h2_connection(Reason, Data#conn_data{socket = undefined});
+
+connected(info, {ssl_error, Socket, Reason}, #conn_data{socket = Socket, protocol = http2} = Data) ->
+    close_h2_connection(Reason, Data#conn_data{socket = undefined});
 
 connected(info, {tcp_closed, Socket}, #conn_data{socket = Socket} = Data) ->
     {next_state, closed, Data#conn_data{socket = undefined}};
@@ -1461,6 +1521,9 @@ closed({call, From}, connect, Data) ->
     end;
 
 closed({call, From}, get_state, _Data) ->
+    {keep_state_and_data, [{reply, From, {ok, closed}}]};
+
+closed({call, From}, shared_status, _Data) ->
     {keep_state_and_data, [{reply, From, {ok, closed}}]};
 
 closed(info, {'DOWN', Ref, process, _Pid, _Reason}, #conn_data{owner_mon = Ref} = Data) ->
@@ -2102,6 +2165,96 @@ auto_release_to_pool(#conn_data{pool_pid = PoolPid, owner_mon = OldMon} = Data) 
     notify_pool_available(Data2),
     Data2.
 
+ensure_h2_socket_active(#conn_data{protocol = http2, socket = undefined}) ->
+    {error, closed};
+ensure_h2_socket_active(#conn_data{protocol = http2, transport = Transport, socket = Socket}) ->
+    Transport:setopts(Socket, [{active, once}]);
+ensure_h2_socket_active(_Data) ->
+    ok.
+
+shared_h2_timeout_actions(#conn_data{protocol = http2} = Data) ->
+    case is_shared_h2_idle(Data) of
+        true ->
+            case Data#conn_data.idle_timeout of
+                infinity -> [];
+                Timeout -> [{state_timeout, Timeout, idle_timeout}]
+            end;
+        false ->
+            [{state_timeout, infinity, idle_timeout}]
+    end;
+shared_h2_timeout_actions(_Data) ->
+    [].
+
+is_shared_h2_idle(#conn_data{protocol = http2, pool_pid = PoolPid, owner = PoolPid,
+                             h2_streams = Streams})
+  when PoolPid =/= undefined ->
+    maps:size(Streams) =:= 0;
+is_shared_h2_idle(_Data) ->
+    false.
+
+shared_connection_status(#conn_data{protocol = http3, h3_conn = undefined} = Data) ->
+    {close, closed, Data};
+shared_connection_status(#conn_data{protocol = http3} = Data) ->
+    {keep, Data};
+shared_connection_status(#conn_data{protocol = http2, socket = undefined} = Data) ->
+    {close_h2, closed, Data};
+shared_connection_status(#conn_data{protocol = http2, transport = Transport, socket = Socket} = Data) ->
+    case has_pending_close(Socket) of
+        true ->
+            {close_h2, closed, Data#conn_data{socket = undefined}};
+        false ->
+            case check_socket_health(Transport, Socket) of
+                ok ->
+                    {keep, Data};
+                {error, Reason} ->
+                    {close_h2, Reason, Data#conn_data{socket = undefined}}
+            end
+    end;
+shared_connection_status(#conn_data{socket = undefined} = Data) ->
+    {close, closed, Data};
+shared_connection_status(#conn_data{transport = Transport, socket = Socket} = Data) ->
+    case check_socket_health(Transport, Socket) of
+        ok ->
+            {keep, Data};
+        {error, Reason} ->
+            {close, Reason, Data#conn_data{socket = undefined}}
+    end.
+
+apply_shared_status_result(From, {keep, Data}) ->
+    {keep_state, Data, [{reply, From, {ok, connected}}]};
+apply_shared_status_result(From, {close, _Reason, Data}) ->
+    {next_state, closed, Data, [{reply, From, {ok, closed}}]};
+apply_shared_status_result(From, {close_h2, Reason, Data}) ->
+    close_h2_connection(Reason, Data, [{reply, From, {ok, closed}}]).
+
+close_h2_connection(Reason, Data) ->
+    close_h2_connection(Reason, Data, []).
+
+close_h2_connection(Reason, Data, ExtraActions) ->
+    {ClosedData, Actions} = fail_h2_waiters(Reason, Data),
+    {next_state, closed, ClosedData, ExtraActions ++ Actions}.
+
+fail_h2_waiters(Reason, #conn_data{h2_streams = Streams} = Data) ->
+    Actions = maps:fold(fun(_StreamId, StreamState, Acc) ->
+        fail_h2_stream_waiter(Reason, StreamState, Acc)
+    end, [], Streams),
+    {reset_async(Data#conn_data{h2_streams = #{}, request_from = undefined}), Actions}.
+
+fail_h2_stream_waiter(Reason, {From, waiting_response}, Acc) when is_tuple(From) ->
+    [{reply, From, {error, Reason}} | Acc];
+fail_h2_stream_waiter(Reason, {From, {waiting_body, _Status, _Headers, _AccBody}}, Acc)
+  when is_tuple(From) ->
+    [{reply, From, {error, Reason}} | Acc];
+fail_h2_stream_waiter(Reason, {_StreamTo, {waiting_headers_async, _AsyncMode, StreamTo, Ref}}, Acc) ->
+    StreamTo ! {hackney_response, Ref, {error, Reason}},
+    Acc;
+fail_h2_stream_waiter(Reason, {_StreamTo, {streaming_body_async, _AsyncMode, StreamTo, Ref,
+                                           _Status, _Headers}}, Acc) ->
+    StreamTo ! {hackney_response, Ref, {error, Reason}},
+    Acc;
+fail_h2_stream_waiter(_Reason, _StreamState, Acc) ->
+    Acc.
+
 %% @private Check if socket is healthy (not closed by peer)
 %% Note: With active mode enabled on connected sockets, we rely on tcp_closed/ssl_closed
 %% messages to detect server closes. This function now uses peername to verify the
@@ -2401,23 +2554,21 @@ do_h2_request(From, Method, Path, Headers, Body, Data) ->
                         h2_machine = H2Machine3,
                         h2_streams = Streams,
                         method = MethodBin,
-                        path = PathBin,
-                        request_from = From
+                        path = PathBin
                     },
                     %% Set socket to active mode for receiving response
                     case Transport:setopts(Socket, [{active, once}]) of
                         ok ->
                             %% Stay in connected state, wait for response via info messages
-                            {keep_state, NewData};
+                            {keep_state, NewData, [{state_timeout, infinity, idle_timeout}]};
                         {error, SetoptsErr} ->
-                            {next_state, closed, NewData#conn_data{socket = undefined},
-                             [{reply, From, {error, SetoptsErr}}]}
+                            close_h2_connection(SetoptsErr, NewData#conn_data{socket = undefined})
                     end;
                 {error, Reason} ->
-                    {keep_state_and_data, [{reply, From, {error, Reason}}]}
+                    close_h2_connection(Reason, Data, [{reply, From, {error, Reason}}])
             end;
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            close_h2_connection(Reason, Data, [{reply, From, {error, Reason}}])
     end.
 
 %% @private Send an HTTP/2 async request
@@ -2491,16 +2642,17 @@ do_h2_request_async(From, Method, Path, Headers, Body, AsyncMode, StreamTo, _Fol
                     case Transport:setopts(Socket, [{active, once}]) of
                         ok ->
                             %% Reply immediately with {ok, Ref}
-                            {keep_state, NewData, [{reply, From, {ok, Ref}}]};
+                            {keep_state, NewData, [{reply, From, {ok, Ref}},
+                                                   {state_timeout, infinity, idle_timeout}]};
                         {error, SetoptsErr} ->
-                            {next_state, closed, NewData#conn_data{socket = undefined},
-                             [{reply, From, {error, SetoptsErr}}]}
+                            close_h2_connection(SetoptsErr, NewData#conn_data{socket = undefined},
+                                                [{reply, From, {error, SetoptsErr}}])
                     end;
                 {error, Reason} ->
-                    {keep_state_and_data, [{reply, From, {error, Reason}}]}
+                    close_h2_connection(Reason, Data, [{reply, From, {error, Reason}}])
             end;
         {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]}
+            close_h2_connection(Reason, Data, [{reply, From, {error, Reason}}])
     end.
 
 %% @private Send HTTP/2 request body as DATA frames with flow control
@@ -2580,42 +2732,30 @@ normalize_headers(Headers) ->
 %% @private Handle incoming HTTP/2 data
 %% Parses frames and processes them through the h2_machine
 handle_h2_data(RecvData, Data) ->
-    #conn_data{buffer = Buffer, transport = Transport, socket = Socket} = Data,
+    #conn_data{buffer = Buffer} = Data,
     FullData = <<Buffer/binary, RecvData/binary>>,
     case parse_h2_frames(FullData, Data#conn_data{buffer = <<>>}) of
         {ok, NewData} ->
-            %% Continue receiving if we have pending streams
-            case maps:size(NewData#conn_data.h2_streams) > 0 of
-                true ->
-                    case Transport:setopts(Socket, [{active, once}]) of
-                        ok -> {keep_state, NewData};
-                        {error, _} -> {next_state, closed, NewData#conn_data{socket = undefined}}
-                    end;
-                false ->
-                    {keep_state, NewData}
-            end;
-        {reply, Reply, NewData} ->
-            %% Reply to caller and continue
-            case NewData#conn_data.request_from of
-                undefined ->
-                    {keep_state, NewData};
-                From ->
-                    case Transport:setopts(Socket, [{active, once}]) of
-                        ok ->
-                            {keep_state, NewData#conn_data{request_from = undefined}, [{reply, From, Reply}]};
-                        {error, _} ->
-                            {next_state, closed, NewData#conn_data{socket = undefined, request_from = undefined},
-                             [{reply, From, Reply}]}
-                    end
-            end;
+            maybe_rearm_h2_socket(NewData, []);
+        %% Sync HTTP/2 replies are routed from the per-stream state, not the
+        %% connection-wide request_from slot.
+        {reply, From, Reply, NewData} ->
+            maybe_continue_h2_drain(NewData, [{reply, From, Reply}]);
         {error, Reason, NewData} ->
-            %% Error - reply and close
-            case NewData#conn_data.request_from of
-                undefined ->
-                    {next_state, closed, NewData};
-                From ->
-                    {next_state, closed, NewData, [{reply, From, {error, Reason}}]}
-            end
+            close_h2_connection(Reason, NewData)
+    end.
+
+maybe_continue_h2_drain(#conn_data{buffer = <<>>} = Data, Actions) ->
+    maybe_rearm_h2_socket(Data, Actions);
+maybe_continue_h2_drain(Data, Actions) ->
+    {keep_state, Data, Actions ++ [{next_event, internal, drain_h2_buffer}]}.
+
+maybe_rearm_h2_socket(Data, Actions) ->
+    case ensure_h2_socket_active(Data) of
+        ok ->
+            {keep_state, Data, Actions ++ shared_h2_timeout_actions(Data)};
+        {error, _} ->
+            close_h2_connection(closed, Data#conn_data{socket = undefined}, Actions)
     end.
 
 %% @private Parse HTTP/2 frames from buffer
@@ -2625,8 +2765,8 @@ parse_h2_frames(Buffer, Data) ->
             case handle_h2_frame(Frame, Data) of
                 {ok, NewData} ->
                     parse_h2_frames(Rest, NewData);
-                {reply, Reply, NewData} ->
-                    {reply, Reply, NewData#conn_data{buffer = Rest}};
+                {reply, From, Reply, NewData} ->
+                    {reply, From, Reply, NewData#conn_data{buffer = Rest}};
                 {error, Reason, NewData} ->
                     {error, Reason, NewData}
             end;
@@ -2761,8 +2901,8 @@ handle_h2_frame({rst_stream, StreamId, ErrorCode}, Data) ->
     case maps:get(StreamId, Streams, undefined) of
         {From, _} ->
             Streams2 = maps:remove(StreamId, Streams),
-            {reply, {error, {stream_error, ErrorCode}},
-             Data#conn_data{h2_streams = Streams2, request_from = From}};
+            {reply, From, {error, {stream_error, ErrorCode}},
+             Data#conn_data{h2_streams = Streams2}};
         undefined ->
             {ok, Data}
     end;
@@ -2840,10 +2980,9 @@ do_handle_h2_data_body(StreamId, IsFin, BodyData, H2Machine0, Data) ->
                 fin ->
                     %% Body complete - reply
                     Streams2 = maps:remove(StreamId, Streams),
-                    {reply, {ok, Status, Headers, NewBody},
+                    {reply, From, {ok, Status, Headers, NewBody},
                      Data#conn_data{h2_machine = H2Machine, h2_streams = Streams2,
-                                    status = Status, response_headers = Headers,
-                                    request_from = From}};
+                                    status = Status, response_headers = Headers}};
                 nofin ->
                     %% More body data expected
                     Streams2 = maps:put(StreamId, {From, {waiting_body, Status, Headers, NewBody}}, Streams),
@@ -2925,15 +3064,13 @@ do_handle_h2_headers(StreamId, _IsFin, Frame, Data) ->
                         fin ->
                             %% No body - reply immediately
                             Streams2 = maps:remove(StreamId, Streams),
-                            {reply, {ok, Status, Headers},
+                            {reply, From, {ok, Status, Headers},
                              Data#conn_data{h2_machine = H2Machine2, h2_streams = Streams2,
-                                            status = Status, response_headers = Headers,
-                                            request_from = From}};
+                                            status = Status, response_headers = Headers}};
                         nofin ->
                             %% Body follows - update stream state
                             Streams2 = maps:put(StreamId, {From, {waiting_body, Status, Headers, <<>>}}, Streams),
-                            {ok, Data#conn_data{h2_machine = H2Machine2, h2_streams = Streams2,
-                                                request_from = From}}
+                            {ok, Data#conn_data{h2_machine = H2Machine2, h2_streams = Streams2}}
                     end;
                 {_StreamTo, {waiting_headers_async, AsyncMode, StreamTo, Ref}} ->
                     %% Async mode - send status and headers to StreamTo

@@ -798,7 +798,7 @@ connected({call, From}, is_ready, #conn_data{transport = Transport, socket = Soc
                     flush_socket_messages(Socket),
                     {keep_state_and_data, [{reply, From, {ok, connected}}]};
                 {error, _} ->
-                    {keep_state_and_data, [{reply, From, {ok, closed}}]}
+                    {next_state, closed, Data, [{reply, From, {ok, closed}}]}
             end
     end;
 

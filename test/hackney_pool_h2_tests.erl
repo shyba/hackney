@@ -249,6 +249,33 @@ h2_shared_integration_test_() ->
              fun(Ctx) ->
                  [?_test(test_shared_h2_status_closes_dead_connection(Ctx))]
              end}
+        },
+        {
+            "shared H2 GOAWAY allows safe streams to complete",
+            {setup,
+             fun() -> setup_local_h2(pool_h2_goaway_partial) end,
+             fun cleanup_local_h2/1,
+             fun(Ctx) ->
+                 [?_test(test_shared_h2_goaway_partial_streams(Ctx))]
+             end}
+        },
+        {
+            "shared H2 GOAWAY rejects all when LastStreamId=0",
+            {setup,
+             fun() -> setup_local_h2(pool_h2_goaway_all_rejected) end,
+             fun cleanup_local_h2/1,
+             fun(Ctx) ->
+                 [?_test(test_shared_h2_goaway_all_rejected(Ctx))]
+             end}
+        },
+        {
+            "shared H2 GOAWAY draining rejects new requests",
+            {setup,
+             fun() -> setup_local_h2(pool_h2_goaway_draining) end,
+             fun cleanup_local_h2/1,
+             fun(Ctx) ->
+                 [?_test(test_shared_h2_goaway_draining_rejects_new_requests(Ctx))]
+             end}
         }
     ].
 
@@ -361,6 +388,43 @@ poll_shared_status_closed(ConnPid, N) ->
             poll_shared_status_closed(ConnPid, N - 1)
     end.
 
+test_shared_h2_goaway_partial_streams({Pool, _ServerPid, Port}) ->
+    {_ConnPid, Opts} = warmup_shared_h2(Pool, Port),
+    URL = local_h2_url(Port, <<"/goaway_partial">>),
+    Results = run_concurrent_requests(URL, Opts, 3),
+    ?assertEqual(3, length(Results)),
+    Successes = [R || R <- Results, matches_success(R)],
+    Errors = [R || R <- Results, matches_goaway_error(R)],
+    ?assertEqual(1, length(Successes)),
+    ?assertEqual(2, length(Errors)).
+
+test_shared_h2_goaway_all_rejected({Pool, _ServerPid, Port}) ->
+    {_ConnPid, Opts} = warmup_shared_h2(Pool, Port),
+    URL = local_h2_url(Port, <<"/goaway_all_rejected">>),
+    Results = run_concurrent_requests(URL, Opts, 2),
+    ?assertEqual(2, length(Results)),
+    ?assert(lists:all(fun(Result) -> matches_error(Result) end, Results)).
+
+test_shared_h2_goaway_draining_rejects_new_requests({Pool, _ServerPid, Port}) ->
+    {_ConnPid, Opts} = warmup_shared_h2(Pool, Port),
+    URL = local_h2_url(Port, <<"/goaway_partial">>),
+    Results = run_concurrent_requests(URL, Opts, 3),
+    ?assertEqual(3, length(Results)),
+    NewURL = local_h2_url(Port, <<"/">>),
+    case hackney:request(get, NewURL, [], <<>>, Opts) of
+        {error, connection_draining} -> ok;
+        {error, closed} -> ok;
+        {error, checkout_timeout} -> ok;
+        {ok, 200, _, _} -> ok
+    end.
+
+matches_goaway_error({error, {goaway, _}}) ->
+    true;
+matches_goaway_error({error, closed}) ->
+    true;
+matches_goaway_error(_) ->
+    false.
+
 warmup_shared_h2(Pool, Port) ->
     Opts = local_h2_opts(Pool),
     URL = local_h2_url(Port, <<"/">>),
@@ -397,7 +461,10 @@ local_h2_port(pool_h2_coalesce) -> 18446;
 local_h2_port(pool_h2_goaway) -> 18447;
 local_h2_port(pool_h2_connect_dedicated) -> 18448;
 local_h2_port(pool_h2_async_refs) -> 18449;
-local_h2_port(pool_h2_status_close) -> 18450.
+local_h2_port(pool_h2_status_close) -> 18450;
+local_h2_port(pool_h2_goaway_partial) -> 18451;
+local_h2_port(pool_h2_goaway_all_rejected) -> 18452;
+local_h2_port(pool_h2_goaway_draining) -> 18453.
 
 run_concurrent_requests(URL, Opts, Count) ->
     Parent = self(),

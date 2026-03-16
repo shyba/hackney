@@ -178,6 +178,8 @@
     %% Map of active HTTP/2 streams: StreamId => {From, StreamState}
     %% StreamState: waiting_headers | waiting_body | done | {push, Headers}
     h2_streams = #{} :: #{pos_integer() => {gen_statem:from() | pid(), atom() | tuple()}},
+    %% Last stream ID from GOAWAY frame (RFC 9113 §6.8)
+    h2_goaway_last_stream_id = undefined :: undefined | non_neg_integer(),
     %% Server push handling: false = reject all (default), pid = send notifications to pid
     enable_push = false :: false | pid(),
 
@@ -989,10 +991,6 @@ connected(info, {ssl, Socket, RecvData}, #conn_data{socket = Socket, protocol = 
     handle_h2_data(RecvData, Data);
 connected(info, {tcp, Socket, RecvData}, #conn_data{socket = Socket, protocol = http2} = Data) ->
     handle_h2_data(RecvData, Data);
-connected(internal, drain_h2_buffer, #conn_data{protocol = http2, buffer = <<>>} = Data) ->
-    maybe_rearm_h2_socket(Data, []);
-connected(internal, drain_h2_buffer, #conn_data{protocol = http2} = Data) ->
-    handle_h2_data(<<>>, Data);
 
 connected(info, {tcp_closed, Socket}, #conn_data{socket = Socket, protocol = http2} = Data) ->
     close_h2_connection(closed, Data#conn_data{socket = undefined});
@@ -2216,11 +2214,6 @@ is_shared_connection(#conn_data{pool_pid = PoolPid, owner = PoolPid, shared_mode
 is_shared_connection(_Data) ->
     false.
 
-is_shared_draining(#conn_data{shared_mode = draining} = Data) ->
-    is_shared_connection(Data);
-is_shared_draining(_Data) ->
-    false.
-
 shared_h2_timeout_actions(#conn_data{protocol = http2} = Data) ->
     case is_shared_h2_idle(Data) of
         true ->
@@ -2283,13 +2276,10 @@ shared_status_reply(From, {closed, #conn_data{protocol = http3} = Data}) ->
 shared_status_reply(From, {closed, Data}) ->
     {next_state, closed, Data, [{reply, From, {ok, closed}}]}.
 
-shared_request_guard(From, Data) ->
-    case is_shared_draining(Data) of
-        true ->
-            {keep_state_and_data, [{reply, From, {error, connection_draining}}]};
-        false ->
-            continue
-    end.
+shared_request_guard(From, #conn_data{shared_mode = draining}) ->
+    {keep_state_and_data, [{reply, From, {error, connection_draining}}]};
+shared_request_guard(_From, _Data) ->
+    continue.
 
 shared_async_guard(From, _AsyncMode, Data) when not is_record(Data, conn_data) ->
     {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
@@ -2314,22 +2304,14 @@ shared_feature_guard(From, Data) ->
             continue
     end.
 
-maybe_unregister_shared(#conn_data{pool_pid = PoolPid, protocol = http2} = Data) ->
-    case is_shared_connection(Data) of
-        true ->
-            gen_server:cast(PoolPid, {unregister_h2, self()}),
-            Data#conn_data{shared_mode = draining};
-        false ->
-            Data
-    end;
-maybe_unregister_shared(#conn_data{pool_pid = PoolPid, protocol = http3} = Data) ->
-    case is_shared_connection(Data) of
-        true ->
-            gen_server:cast(PoolPid, {unregister_h3, self()}),
-            Data#conn_data{shared_mode = draining};
-        false ->
-            Data
-    end;
+maybe_unregister_shared(#conn_data{pool_pid = PoolPid, protocol = http2,
+                                   shared_mode = active} = Data) ->
+    gen_server:cast(PoolPid, {unregister_h2, self()}),
+    Data#conn_data{shared_mode = draining};
+maybe_unregister_shared(#conn_data{pool_pid = PoolPid, protocol = http3,
+                                   shared_mode = active} = Data) ->
+    gen_server:cast(PoolPid, {unregister_h3, self()}),
+    Data#conn_data{shared_mode = draining};
 maybe_unregister_shared(Data) ->
     Data.
 
@@ -2839,19 +2821,15 @@ handle_h2_data(RecvData, Data) ->
     case parse_h2_frames(FullData, Data#conn_data{buffer = <<>>}) of
         {ok, NewData} ->
             maybe_rearm_h2_socket(NewData, []);
-        %% Sync HTTP/2 replies are routed from the per-stream state, not the
-        %% connection-wide request_from slot.
-        {reply, From, Reply, NewData} ->
-            maybe_continue_h2_drain(NewData, [{reply, From, Reply}]);
+        {actions, AccActions, NewData} ->
+            maybe_rearm_h2_socket(NewData, AccActions);
         {error, Reason, NewData} ->
             close_h2_connection(Reason, NewData)
     end.
 
-maybe_continue_h2_drain(#conn_data{buffer = <<>>} = Data, Actions) ->
-    maybe_rearm_h2_socket(Data, Actions);
-maybe_continue_h2_drain(Data, Actions) ->
-    {keep_state, Data, Actions ++ [{next_event, internal, drain_h2_buffer}]}.
-
+maybe_rearm_h2_socket(#conn_data{shared_mode = draining, h2_streams = Streams} = Data, Actions)
+  when map_size(Streams) =:= 0 ->
+    close_h2_connection(goaway, Data, Actions);
 maybe_rearm_h2_socket(Data, Actions) ->
     case ensure_h2_socket_active(Data) of
         ok ->
@@ -2862,18 +2840,28 @@ maybe_rearm_h2_socket(Data, Actions) ->
 
 %% @private Parse HTTP/2 frames from buffer
 parse_h2_frames(Buffer, Data) ->
+    parse_h2_frames(Buffer, Data, []).
+
+parse_h2_frames(Buffer, Data, AccActions) ->
     case hackney_http2:parse(Buffer) of
         {ok, Frame, Rest} ->
             case handle_h2_frame(Frame, Data) of
                 {ok, NewData} ->
-                    parse_h2_frames(Rest, NewData);
+                    parse_h2_frames(Rest, NewData, AccActions);
+                {draining, RejectedActions, NewData} ->
+                    parse_h2_frames(Rest, NewData, AccActions ++ RejectedActions);
                 {reply, From, Reply, NewData} ->
-                    {reply, From, Reply, NewData#conn_data{buffer = Rest}};
+                    NewAcc = AccActions ++ [{reply, From, Reply}],
+                    parse_h2_frames(Rest, NewData, NewAcc);
                 {error, Reason, NewData} ->
                     {error, Reason, NewData}
             end;
         more ->
-            {ok, Data#conn_data{buffer = Buffer}};
+            FinalData = Data#conn_data{buffer = Buffer},
+            case AccActions of
+                [] -> {ok, FinalData};
+                _ -> {actions, AccActions, FinalData}
+            end;
         {connection_error, ErrorCode, _Reason} ->
             {error, {h2_connection_error, ErrorCode}, Data}
     end.
@@ -2952,13 +2940,34 @@ handle_h2_frame({ping_ack, _Opaque}, Data) ->
     end;
 
 handle_h2_frame({goaway, LastStreamId, ErrorCode, _DebugData}, Data) ->
-    %% Server is going away
-    #conn_data{h2_machine = H2Machine} = Data,
+    #conn_data{h2_machine = H2Machine, h2_streams = Streams} = Data,
+    UpdateMachine = fun(H2M) ->
+        {SafeStreams, RejectedStreams} = maps:fold(
+            fun(StreamId, StreamState, {Safe, Rejected}) ->
+                case StreamId rem 2 =:= 1 andalso StreamId > LastStreamId of
+                    true -> {Safe, maps:put(StreamId, StreamState, Rejected)};
+                    false -> {maps:put(StreamId, StreamState, Safe), Rejected}
+                end
+            end, {#{}, #{}}, Streams),
+        RejectedActions = maps:fold(fun(_StreamId, StreamState, Acc) ->
+            fail_h2_stream_waiter({goaway, ErrorCode}, StreamState, Acc)
+        end, [], RejectedStreams),
+        Data2 = Data#conn_data{h2_machine = H2M,
+                               h2_goaway_last_stream_id = LastStreamId},
+        case maps:size(SafeStreams) of
+            0 ->
+                {error, {goaway, ErrorCode}, Data2};
+            _ ->
+                Data3 = maybe_unregister_shared(Data2),
+                {draining, RejectedActions,
+                 Data3#conn_data{h2_streams = SafeStreams}}
+        end
+    end,
     case hackney_http2_machine:frame({goaway, LastStreamId, ErrorCode, _DebugData}, H2Machine) of
         {ok, {goaway, _, _, _}, H2Machine2} ->
-            {error, {goaway, ErrorCode}, Data#conn_data{h2_machine = H2Machine2}};
+            UpdateMachine(H2Machine2);
         {ok, H2Machine2} ->
-            {error, {goaway, ErrorCode}, Data#conn_data{h2_machine = H2Machine2}};
+            UpdateMachine(H2Machine2);
         {error, Reason, _H2Machine} ->
             {error, Reason, Data}
     end;

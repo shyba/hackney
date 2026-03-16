@@ -281,6 +281,10 @@ handle_request(Socket, H2Machine0, StreamId, _IsFin, _Headers, PseudoHeaders) ->
             queue_coalesced_response(Socket, H2Machine0, StreamId, Method, Path);
         <<"/goaway_batch">> ->
             queue_goaway_batch(Socket, H2Machine0);
+        <<"/goaway_partial">> ->
+            handle_goaway_partial(Socket, H2Machine0, StreamId, Method, Path);
+        <<"/goaway_all_rejected">> ->
+            handle_goaway_all_rejected(Socket, H2Machine0);
         _ ->
             send_simple_response(Socket, H2Machine0, StreamId, Method, Path)
     end.
@@ -309,8 +313,39 @@ queue_goaway_batch(Socket, H2Machine0) ->
             {ok, H2Machine0};
         true ->
             erlang:erase(goaway_batch_pending),
-            LastStreamId = hackney_http2_machine:get_last_streamid(H2Machine0),
-            ok = send_goaway(Socket, LastStreamId, no_error),
+            ok = send_goaway(Socket, 0, no_error),
+            {ok, H2Machine0}
+    end.
+
+handle_goaway_partial(Socket, H2Machine0, StreamId, Method, Path) ->
+    Count = case erlang:get(goaway_partial_count) of
+        undefined -> 1;
+        N -> N + 1
+    end,
+    erlang:put(goaway_partial_count, Count),
+    case Count of
+        1 ->
+            erlang:put(goaway_partial_first_stream, StreamId),
+            {ok, H2Machine0};
+        3 ->
+            FirstStream = erlang:get(goaway_partial_first_stream),
+            ok = send_goaway(Socket, FirstStream, no_error),
+            {ok, H2Machine1, ResponseFrames} = build_simple_response(
+                H2Machine0, FirstStream, Method, Path),
+            ok = ssl:send(Socket, ResponseFrames),
+            {ok, H2Machine1};
+        _ ->
+            {ok, H2Machine0}
+    end.
+
+handle_goaway_all_rejected(Socket, H2Machine0) ->
+    case erlang:get(goaway_all_rejected_pending) of
+        undefined ->
+            erlang:put(goaway_all_rejected_pending, true),
+            {ok, H2Machine0};
+        true ->
+            erlang:erase(goaway_all_rejected_pending),
+            ok = send_goaway(Socket, 0, no_error),
             {ok, H2Machine0}
     end.
 

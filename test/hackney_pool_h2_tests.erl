@@ -240,6 +240,15 @@ h2_shared_integration_test_() ->
              fun(Ctx) ->
                  [?_test(test_shared_h2_async_refs_are_unique(Ctx))]
              end}
+        },
+        {
+            "shared H2 status closes dead connection",
+            {setup,
+             fun() -> setup_local_h2(pool_h2_status_close) end,
+             fun cleanup_local_h2/1,
+             fun(Ctx) ->
+                 [?_test(test_shared_h2_status_closes_dead_connection(Ctx))]
+             end}
         }
     ].
 
@@ -328,6 +337,30 @@ test_shared_h2_async_refs_are_unique({Pool, _ServerPid, Port}) ->
     ?assert(has_async_done(Msgs1)),
     ?assert(has_async_done(Msgs2)).
 
+test_shared_h2_status_closes_dead_connection({Pool, ServerPid, Port}) ->
+    {ConnPid, _Opts} = warmup_shared_h2(Pool, Port),
+    MonRef = erlang:monitor(process, ConnPid),
+    h2spec_server:stop(ServerPid),
+    timer:sleep(50),
+    poll_shared_status_closed(ConnPid, 20),
+    receive
+        {'DOWN', MonRef, process, ConnPid, _} -> ok
+    after ?LOCAL_TIMEOUT ->
+        ?assert(false)
+    end,
+    ?assertNot(erlang:is_process_alive(ConnPid)).
+
+poll_shared_status_closed(_ConnPid, 0) ->
+    ok;
+poll_shared_status_closed(ConnPid, N) ->
+    case catch hackney_conn:shared_status(ConnPid) of
+        {ok, closed} -> ok;
+        {'EXIT', {noproc, _}} -> ok;
+        _ ->
+            timer:sleep(50),
+            poll_shared_status_closed(ConnPid, N - 1)
+    end.
+
 warmup_shared_h2(Pool, Port) ->
     Opts = local_h2_opts(Pool),
     URL = local_h2_url(Port, <<"/">>),
@@ -363,7 +396,8 @@ local_h2_port(pool_h2_owner_handoff) -> 18445;
 local_h2_port(pool_h2_coalesce) -> 18446;
 local_h2_port(pool_h2_goaway) -> 18447;
 local_h2_port(pool_h2_connect_dedicated) -> 18448;
-local_h2_port(pool_h2_async_refs) -> 18449.
+local_h2_port(pool_h2_async_refs) -> 18449;
+local_h2_port(pool_h2_status_close) -> 18450.
 
 run_concurrent_requests(URL, Opts, Count) ->
     Parent = self(),

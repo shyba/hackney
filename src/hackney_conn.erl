@@ -2241,38 +2241,47 @@ is_shared_h2_idle(#conn_data{protocol = http2, pool_pid = PoolPid, owner = PoolP
 is_shared_h2_idle(_Data) ->
     false.
 
-shared_connection_status(#conn_data{shared_mode = draining}) ->
-    draining;
-shared_connection_status(#conn_data{protocol = http3, h3_conn = undefined}) ->
-    closed;
-shared_connection_status(#conn_data{protocol = http3}) ->
-    connected;
-shared_connection_status(#conn_data{protocol = http2, socket = undefined}) ->
-    closed;
-shared_connection_status(#conn_data{protocol = http2, transport = Transport, socket = Socket}) ->
+shared_connection_status(#conn_data{shared_mode = draining} = Data) ->
+    {draining, Data};
+shared_connection_status(#conn_data{protocol = http3, h3_conn = undefined} = Data) ->
+    {closed, Data};
+shared_connection_status(#conn_data{protocol = http3} = Data) ->
+    {connected, Data};
+shared_connection_status(#conn_data{protocol = http2, socket = undefined} = Data) ->
+    {closed, Data};
+shared_connection_status(#conn_data{protocol = http2, transport = Transport,
+                                    socket = Socket} = Data) ->
     case has_pending_close(Socket) of
         true ->
-            closed;
+            {closed, Data#conn_data{socket = undefined}};
         false ->
             case check_socket_health(Transport, Socket) of
                 ok ->
-                    connected;
+                    {connected, Data};
                 {error, _Reason} ->
-                    closed
+                    {closed, Data#conn_data{socket = undefined}}
             end
     end;
-shared_connection_status(#conn_data{socket = undefined}) ->
-    closed;
-shared_connection_status(#conn_data{transport = Transport, socket = Socket}) ->
+shared_connection_status(#conn_data{socket = undefined} = Data) ->
+    {closed, Data};
+shared_connection_status(#conn_data{transport = Transport, socket = Socket} = Data) ->
     case check_socket_health(Transport, Socket) of
         ok ->
-            connected;
+            {connected, Data};
         {error, _Reason} ->
-            closed
+            {closed, Data}
     end.
 
-shared_status_reply(From, Status) ->
-    {keep_state_and_data, [{reply, From, {ok, Status}}]}.
+shared_status_reply(From, {connected, _Data}) ->
+    {keep_state_and_data, [{reply, From, {ok, connected}}]};
+shared_status_reply(From, {draining, _Data}) ->
+    {keep_state_and_data, [{reply, From, {ok, draining}}]};
+shared_status_reply(From, {closed, #conn_data{protocol = http2} = Data}) ->
+    close_h2_connection(closed, Data, [{reply, From, {ok, closed}}]);
+shared_status_reply(From, {closed, #conn_data{protocol = http3} = Data}) ->
+    fail_h3_and_close(closed, Data, [{reply, From, {ok, closed}}]);
+shared_status_reply(From, {closed, Data}) ->
+    {next_state, closed, Data, [{reply, From, {ok, closed}}]}.
 
 shared_request_guard(From, Data) ->
     case is_shared_draining(Data) of
@@ -3645,15 +3654,13 @@ handle_h3_error(Error, Data) ->
 %% @private Shared helper for HTTP/3 connection termination.
 %% Notifies all pending streams and transitions to closed state.
 handle_h3_termination(Error, Data) ->
+    fail_h3_and_close(Error, Data, []).
+
+fail_h3_and_close(Reason, Data, ExtraActions) ->
     #conn_data{h3_streams = Streams} = Data,
-    %% Notify all pending streams (sync and async)
-    Actions = maps:fold(fun(_StreamId, StreamState, Acc) ->
-        h3_stream_error_actions(Error, StreamState, Acc)
+    StreamActions = maps:fold(fun(_StreamId, StreamState, Acc) ->
+        h3_stream_error_actions(Reason, StreamState, Acc)
     end, [], Streams),
-    %% Clear connection state
-    NewData = Data#conn_data{
-        h3_conn = undefined,
-        h3_streams = #{},
-        shared_mode = draining
-    },
-    {next_state, closed, maybe_unregister_shared(NewData), Actions}.
+    Data2 = maybe_unregister_shared(Data),
+    NewData = Data2#conn_data{h3_conn = undefined, h3_streams = #{}},
+    {next_state, closed, NewData, ExtraActions ++ StreamActions}.

@@ -362,7 +362,10 @@ test_shared_h2_async_refs_are_unique({Pool, _ServerPid, Port}) ->
     Msgs1 = collect_async_messages(Ref1, []),
     Msgs2 = collect_async_messages(Ref2, []),
     ?assert(has_async_done(Msgs1)),
-    ?assert(has_async_done(Msgs2)).
+    ?assert(has_async_done(Msgs2)),
+    OnceOpts = [{async, once} | Opts],
+    ?assertEqual({error, {unsupported_async_mode, once}},
+                 hackney:get(URL, [], <<>>, OnceOpts)).
 
 test_shared_h2_status_closes_dead_connection({Pool, ServerPid, Port}) ->
     {ConnPid, _Opts} = warmup_shared_h2(Pool, Port),

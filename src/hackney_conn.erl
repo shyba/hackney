@@ -2288,7 +2288,7 @@ shared_async_guard(From, AsyncMode, Data) ->
         continue ->
             case is_shared_connection(Data) andalso AsyncMode =/= true of
                 true ->
-                    {keep_state_and_data, [{reply, From, {error, unsupported_on_shared_connection}}]};
+                    {keep_state_and_data, [{reply, From, {error, {unsupported_async_mode, AsyncMode}}}]};
                 false ->
                     continue
             end;

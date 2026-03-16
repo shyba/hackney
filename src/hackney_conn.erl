@@ -2281,8 +2281,6 @@ shared_request_guard(From, #conn_data{shared_mode = draining}) ->
 shared_request_guard(_From, _Data) ->
     continue.
 
-shared_async_guard(From, _AsyncMode, Data) when not is_record(Data, conn_data) ->
-    {keep_state_and_data, [{reply, From, {error, invalid_state}}]};
 shared_async_guard(From, AsyncMode, Data) ->
     case shared_request_guard(From, Data) of
         continue ->
@@ -2326,7 +2324,7 @@ fail_h2_waiters(Reason, #conn_data{h2_streams = Streams} = Data) ->
     Actions = maps:fold(fun(_StreamId, StreamState, Acc) ->
         fail_h2_stream_waiter(Reason, StreamState, Acc)
     end, [], Streams),
-    {Data#conn_data{h2_streams = #{}, request_from = undefined}, Actions}.
+    {Data#conn_data{h2_streams = #{}}, Actions}.
 
 fail_h2_stream_waiter(Reason, {From, waiting_response}, Acc) when is_tuple(From) ->
     [{reply, From, {error, Reason}} | Acc];

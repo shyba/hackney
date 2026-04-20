@@ -750,8 +750,16 @@ start_connection(Key, Owner, Opts, State) ->
 
     case hackney_conn_sup:start_conn(ConnOpts) of
         {ok, Pid} ->
-            %% Connect the connection
-            case hackney_conn:connect(Pid) of
+            %% Connect the connection. The connection gen_statem may exit
+            %% before this gen_statem:call reaches it (e.g. fast TCP failure
+            %% or normal-exit race on idle-timer cancel). Trap that so the
+            %% pool gen_server is not taken down with the caller.
+            ConnectResult =
+                try hackney_conn:connect(Pid)
+                catch exit:{noproc, _} -> {error, noproc};
+                      exit:{normal, _} -> {error, normal}
+                end,
+            case ConnectResult of
                 ok ->
                     %% Monitor the process
                     MonRef = erlang:monitor(process, Pid),

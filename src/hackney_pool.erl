@@ -756,8 +756,13 @@ start_connection(Key, Owner, Opts, State) ->
             %% pool gen_server is not taken down with the caller.
             ConnectResult =
                 try hackney_conn:connect(Pid)
-                catch exit:{noproc, _} -> {error, noproc};
-                      exit:{normal, _} -> {error, normal}
+                catch
+                    %% Empirically observed exits from the hackney_conn
+                    %% gen_statem:call: noproc (already dead), normal
+                    %% (exit-idle race), timeout (no reply within 8s).
+                    exit:{noproc, _}  -> {error, noproc};
+                    exit:{normal, _}  -> {error, normal};
+                    exit:{timeout, _} -> {error, timeout}
                 end,
             case ConnectResult of
                 ok ->
